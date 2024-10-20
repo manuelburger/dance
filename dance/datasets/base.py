@@ -104,6 +104,9 @@ class BaseDataset(ABC):
 
         raw_data = self.load_raw_data()
         data = self._raw_to_dance(raw_data)
+
+        # import ipdb; ipdb.set_trace()
+
         logger.info(f"Raw data loaded:\n{data}")
 
         if transform is not None:

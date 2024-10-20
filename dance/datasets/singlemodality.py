@@ -7,6 +7,7 @@ import sys
 from glob import glob
 
 import anndata as ad
+import ipdb
 import h5py
 import numpy as np
 import pandas as pd
@@ -238,6 +239,7 @@ class CellTypeAnnotationDataset(BaseDataset):
                 logger.debug(f"{i}:{j}\t-> {k}")
 
             logger.info(f"Loaded expression data: {adata}")
+            
             logger.info(f"Number of training samples: {train_feat.shape[0]:,}")
             logger.info(f"Number of valid samples: {valid_feat.shape[0]:,}")
             logger.info(f"Number of testing samples: {test_feat.shape[0]:,}")
@@ -264,6 +266,7 @@ class CellTypeAnnotationDataset(BaseDataset):
                 logger.debug(f"{i}:{j}\t-> {k}")
 
             logger.info(f"Loaded expression data: {adata}")
+
             logger.info(f"Number of training samples: {train_feat.shape[0]:,}")
             logger.info(f"Number of testing samples: {test_feat.shape[0]:,}")
             logger.info(f"Cell-types (n={len(idx_to_label)}):\n{pprint.pformat(idx_to_label)}")

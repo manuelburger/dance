@@ -11,12 +11,111 @@ import scanpy as sc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 from torch import Tensor
+import logging
+import itertools
+from dance import logger
 
 from dance.models.nn import VanillaMLP
 from dance.modules.base import BaseClassificationMethod
 from dance.transforms import AnnDataTransform, Compose, FilterGenesPercentile, SetConfig
 from dance.typing import LogLevel, Optional, Tuple
+
+class FeatureEmbedding(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, aggregation: str = "mean"):
+        super().__init__()
+        
+        self.embedding = nn.Parameter(torch.randn(input_dim, hidden_dim))
+        self.bias = nn.Parameter(torch.zeros(hidden_dim))
+        self.aggregation = aggregation
+
+    def forward(self, x: Tensor):
+        # num_genes = x.shape[1]
+        # gene_indices = torch.arange(num_genes).to(x.device)
+        # gene_indices = gene_indices.repeat(x.shape[0], 1)
+        batch_dim = x.shape[0]
+        gene_embedding = self.embedding.unsqueeze(0).expand(batch_dim, -1, -1)
+        x = x.unsqueeze(-1) * gene_embedding # scale gene expression by gene embedding
+        x = x + self.bias
+
+        if self.aggregation == "mean":
+            x = x.mean(dim=1)
+        elif self.aggregation == "sum":
+            x = x.sum(dim=1)
+        elif self.aggregation == "max":
+            x = x.max(dim=1).values
+        else:
+            raise ValueError(f"Invalid aggregation method: {self.aggregation}")
+
+        return x
+    
+
+class FeatureEmbeddingMLP(nn.Module):
+    """Vanilla multilayer perceptron with ReLU activation.
+
+    Parameters
+    ----------
+    input_dim
+        Input feature dimension.
+    output_dim
+        Output dimension.
+    hidden_dims
+        Hidden layer dimensions.
+    device
+        Computation device.
+    random_seed
+        Random seed controlling the model weights initialization.
+
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, *, hidden_dims: Tuple[int, ...] = (100, 50, 25),
+                 device: str = "cpu", random_seed: Optional[int] = None, aggregation: str = "mean"):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dims = hidden_dims
+        self.device = device
+        self.random_seed = random_seed
+
+        embedding = FeatureEmbedding(input_dim, hidden_dims[0], aggregation=aggregation)
+        self.aggregation = aggregation
+
+        if len(hidden_dims) == 1:
+            self.model = nn.Sequential(
+                embedding,
+                nn.Linear(hidden_dims[0], output_dim),
+            ).to(device)
+        else:
+            self.model = nn.Sequential(
+                embedding,
+                nn.Linear(hidden_dims[0], hidden_dims[1]),
+                nn.ReLU(),
+                *itertools.chain.from_iterable(
+                    zip(
+                        map(nn.Linear, hidden_dims[1:-1], hidden_dims[2:]),
+                        itertools.repeat(nn.ReLU()),
+                    )),
+                nn.Linear(hidden_dims[-1], output_dim),
+            ).to(device)
+
+        self.initialize_parameters()
+        logger.debug(f"Initialized model:\n{self.model}")
+
+    def forward(self, x):
+        return self.model(x)
+
+    @torch.no_grad()
+    def initialize_parameters(self):
+        """Initialize parameters."""
+        if self.random_seed is not None:
+            torch.manual_seed(self.random_seed)
+
+        for i in range(0, len(self.model), 2):
+            if isinstance(self.model[i], nn.Linear):
+                nn.init.xavier_normal_(self.model[i].weight)
+                self.model[i].bias[:] = 0
 
 
 class ACTINN(BaseClassificationMethod):
@@ -40,6 +139,8 @@ class ACTINN(BaseClassificationMethod):
         lambd: float = 0.01,
         device: str = "cpu",
         random_seed: Optional[int] = None,
+        use_feature_embedding: bool = False,
+        use_pretrained_gene_embedding: bool = False,
     ):
         super().__init__()
 
@@ -49,6 +150,10 @@ class ACTINN(BaseClassificationMethod):
         self.random_seed = random_seed
 
         self.model_size = len(hidden_dims) + 2
+
+        self.use_feature_embedding = use_feature_embedding
+        self.use_pretrained_gene_embedding = use_pretrained_gene_embedding
+        self.gene_names = []
 
     @staticmethod
     def preprocessing_pipeline(normalize: bool = True, filter_genes: bool = True, log_level: LogLevel = "INFO"):
@@ -86,7 +191,7 @@ class ACTINN(BaseClassificationMethod):
         log_prob = F.log_softmax(z, dim=-1)
         loss = nn.NLLLoss()(log_prob, y)
         for i, p in enumerate(self.model.model):
-            if (i % 2) == 0:  # skip activation layers
+            if isinstance(p, nn.Linear):
                 loss += self.lambd * (p.weight**2).sum() / 2
         return loss
 
@@ -147,7 +252,18 @@ class ACTINN(BaseClassificationMethod):
         y_train = torch.where(y_train)[1].to(self.device)  # cells
 
         # Initialize weights, optimizer, and scheduler
-        self.model = VanillaMLP(input_dim, output_dim, hidden_dims=self.hidden_dims, device=self.device)
+        if self.use_feature_embedding:
+            self.model = FeatureEmbeddingMLP(
+                input_dim, output_dim, hidden_dims=self.hidden_dims, device=self.device, aggregation="sum")
+            if self.use_pretrained_gene_embedding:
+                assert len(self.gene_names) == input_dim, "Gene names must be provided for pretrained gene embedding."
+            
+        else:
+            self.model = VanillaMLP(input_dim, output_dim, hidden_dims=self.hidden_dims, device=self.device)
+
+
+        print(f"Model: {self.model}")
+
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=optimizer, gamma=0.95)
 
@@ -158,7 +274,7 @@ class ACTINN(BaseClassificationMethod):
             batches = self.random_batches(x_train, y_train, batch_size, epoch_seed)
 
             tot_cost = tot_size = 0
-            for batch_x, batch_y in batches:
+            for batch_x, batch_y in tqdm(batches, total=len(x_train) // batch_size):
                 batch_cost = self.compute_loss(self.model(batch_x), batch_y)
                 tot_cost += batch_cost.item()
                 tot_size += 1
@@ -190,6 +306,21 @@ class ACTINN(BaseClassificationMethod):
 
         """
         x = x.clone().detach().to(self.device)
-        z = self.model(x)
-        prediction = torch.argmax(z, dim=-1)
-        return prediction
+
+        batch_size = 128
+        num_batches = x.shape[0] // batch_size
+        if x.shape[0] % batch_size:
+            num_batches += 1
+
+        for i in range(num_batches):
+            batch_x = x[i * batch_size:(i + 1) * batch_size]
+            z = self.model(batch_x)
+            if i == 0:
+                predictions = torch.argmax(z, dim=-1)
+            else:
+                predictions = torch.cat((predictions, torch.argmax(z, dim=-1)))
+
+        # z = self.model(x)
+        # prediction = torch.argmax(z, dim=-1)
+        
+        return predictions

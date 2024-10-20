@@ -3,6 +3,7 @@ import pprint
 from typing import get_args
 
 import numpy as np
+import ipdb
 
 from dance import logger
 from dance.datasets.singlemodality import CellTypeAnnotationDataset
@@ -37,13 +38,16 @@ if __name__ == "__main__":
     logger.info(f"Running SVM with the following parameters:\n{pprint.pformat(vars(args))}")
 
     # Initialize model and get model specific preprocessing pipeline
-    model = ACTINN(hidden_dims=args.hidden_dims, lambd=args.lambd, device=args.device)
+    model = ACTINN(hidden_dims=args.hidden_dims, lambd=args.lambd, device=args.device, use_feature_embedding=True)
     preprocessing_pipeline = model.preprocessing_pipeline(normalize=args.normalize, filter_genes=not args.nofilter)
 
     # Load data and perform necessary preprocessing
     dataloader = CellTypeAnnotationDataset(train_dataset=args.train_dataset, test_dataset=args.test_dataset,
                                            tissue=args.tissue, species=args.species, val_size=args.val_size)
     data = dataloader.load_data(transform=preprocessing_pipeline, cache=args.cache)
+
+    gene_names = data.data.var.index.tolist()
+    model.gene_names = gene_names
 
     # Obtain training and testing data
     x_train, y_train = data.get_train_data(return_type="torch")
